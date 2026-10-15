@@ -32,6 +32,7 @@ from backend.util.sandbox_files import (
     extract_and_store_sandbox_files,
 )
 from backend.util.sandbox_metadata import SandboxMetadata, owned_by_user
+from backend.util.settings import Settings
 
 if TYPE_CHECKING:
     from backend.executor.utils import ExecutionContext
@@ -327,6 +328,8 @@ class ClaudeCodeBlock(Block):
 
         sandbox = None
         sandbox_id = ""
+        cli_started = False
+        reported_cost_usd: Optional[float] = None
         egress_owner = EgressOwner(
             kind="block",
             id=execution_context.user_id or "anonymous",
@@ -443,6 +446,9 @@ class ClaudeCodeBlock(Block):
                 timestamp_result.stdout.strip() if timestamp_result.stdout else None
             )
 
+            # From here on the CLI may spend on the Anthropic key, whatever
+            # becomes of the command (see the minimum charge in `finally`).
+            cli_started = True
             result = await sandbox.commands.run(
                 claude_command,
                 timeout=0,  # No command timeout - let sandbox timeout handle it
@@ -466,7 +472,7 @@ class ClaudeCodeBlock(Block):
                 # The JSON output contains the result
                 output_data = json.loads(raw_output)
                 response = output_data.get("result", raw_output)
-                self._record_cli_cost(output_data)
+                reported_cost_usd = self._record_cli_cost(output_data)
 
                 # Build conversation history entry
                 turn_entry = f"User: {prompt}\nClaude: {response}"
@@ -513,6 +519,8 @@ class ClaudeCodeBlock(Block):
             raise ClaudeCodeExecutionError(str(e), sandbox_id) from e
 
         finally:
+            if cli_started:
+                self._record_minimum_run_cost(reported_cost_usd)
             if dispose_sandbox and sandbox:
                 await kill_sandbox(sandbox)
 
@@ -522,22 +530,45 @@ class ClaudeCodeBlock(Block):
         escaped = prompt.replace("'", "'\"'\"'")
         return f"'{escaped}'"
 
-    def _record_cli_cost(self, output_data: dict) -> None:
+    def _record_cli_cost(self, output_data: dict) -> Optional[float]:
         """Feed Claude Code CLI's `total_cost_usd` to the COST_USD resolver.
 
         The CLI rolls up Anthropic LLM + internal tool-call spend into
         ``total_cost_usd`` on its JSON response; piping it through
         ``merge_stats`` lets the wallet reflect real spend.
+
+        Returns the recorded cost, or ``None`` when the CLI reported none.
         """
         total_cost_usd = output_data.get("total_cost_usd")
         if total_cost_usd is None:
-            return
+            return None
         self.merge_stats(
             NodeExecutionStats(
                 provider_cost=float(total_cost_usd),
                 provider_cost_type="cost_usd",
             )
         )
+        return float(total_cost_usd)
+
+    def _record_minimum_run_cost(self, reported_cost_usd: Optional[float]) -> None:
+        """Top the run's cost up to ``claude_code_min_run_cost_usd``.
+
+        The cost comes only from the JSON the CLI prints when it exits cleanly.
+        A run that started the CLI but timed out, was killed or exited non-zero
+        prints none, although the Anthropic calls it made were already paid
+        for. The difference between the minimum and what was reported (if
+        anything) is merged, so the run is billed at least the minimum and
+        otherwise what the CLI reported.
+        """
+        minimum_usd = Settings().config.claude_code_min_run_cost_usd
+        shortfall_usd = minimum_usd - (reported_cost_usd or 0.0)
+        if shortfall_usd > 0:
+            self.merge_stats(
+                NodeExecutionStats(
+                    provider_cost=shortfall_usd,
+                    provider_cost_type="cost_usd",
+                )
+            )
 
     async def run(
         self,

@@ -501,6 +501,15 @@ class Config(UpdateTrackingModel["Config"], BaseSettings):
         "This is necessary to make sure webhooks find their way.",
     )
 
+    claude_code_min_run_cost_usd: float = Field(
+        default=0.02,
+        ge=0,
+        description="Least cost in USD billed for a Claude Code run that started "
+        "the CLI. The CLI's own total_cost_usd is used when it is larger; the "
+        "minimum covers a run that timed out, was killed, exited non-zero or "
+        "printed no cost. 0 bills only what the CLI reports.",
+    )
+
     e2b_egress_proxy_address: str = Field(
         default="",
         description="host:port of the SOCKS5 credential swap proxy every E2B box "
