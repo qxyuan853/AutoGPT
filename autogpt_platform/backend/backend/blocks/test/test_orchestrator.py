@@ -922,7 +922,7 @@ async def test_orchestrator_agent_mode():
         mock_execution_processor.on_node_execution = AsyncMock(
             return_value=mock_node_stats
         )
-        # Mock charge_node_usage (called after successful tool execution).
+        # Mock charge_node_usage (called before the tool executes; pins the baseline).
         # Returns (cost, remaining_balance). Must be AsyncMock because it is
         # an async method and is directly awaited in _execute_single_tool_with_manager.
         # Use a non-zero cost so the merge_stats branch is exercised.
@@ -974,7 +974,7 @@ async def test_orchestrator_agent_mode():
 
         # Verify charge_node_usage was actually called for the successful
         # tool execution — this guards against regressions where the
-        # post-execution tool charging is accidentally removed.
+        # tool charging is accidentally removed.
         assert mock_execution_processor.charge_node_usage.call_count == 1
 
 
@@ -1219,3 +1219,81 @@ async def test_orchestrator_agent_falls_back_to_graph_name():
     assert result["type"] == "function"
     assert result["function"]["name"] == "original_agent_name"  # Graph name cleaned
     assert result["function"]["_sink_node_id"] == "test-agent-node-id"
+
+
+@pytest.mark.asyncio
+async def test_nested_tool_reconciles_against_the_charge_actually_collected():
+    """A nested tool execution must reach reconciliation with a pre-flight
+    baseline equal to what was charged for it.
+
+    Kills: building the nested NodeExecutionEntry without pre_flight_charge,
+    so charge_reconciled_usage re-derives the catalogue pre-flight and, for a
+    tool call that fails before any usage is tracked, credits that amount to
+    the wallet although it was never debited.
+    """
+    from backend.blocks.orchestrator import (
+        ExecutionParams,
+        OrchestratorBlock,
+        ToolInfo,
+    )
+
+    block = OrchestratorBlock()
+    mock_db_client = AsyncMock()
+    target_node = MagicMock()
+    target_node.input_default = {"model": "gpt-5.5-pro"}
+    target_node.block_id = "1f292d4a-41a4-4977-9684-7c8d560b9f91"
+    mock_db_client.get_node.return_value = target_node
+    node_exec_result = MagicMock()
+    node_exec_result.node_exec_id = "nested-exec-id"
+    mock_db_client.upsert_execution_input.return_value = (
+        node_exec_result,
+        {"model": "gpt-5.5-pro", "prompt": "x"},
+    )
+
+    order: list[str] = []
+    seen_baseline: list = []
+
+    async def charge(entry):
+        order.append("charge")
+        entry.pre_flight_charge = 60
+        return 60, 40
+
+    async def run_node(node_exec, **_kwargs):
+        order.append("run")
+        seen_baseline.append(node_exec.pre_flight_charge)
+        stats = MagicMock()
+        stats.error = RuntimeError("tool failed before any usage was tracked")
+        return stats
+
+    processor = MagicMock()
+    processor.nodes_input_masks = None
+    processor.running_node_execution = defaultdict(MagicMock)
+    processor.execution_stats = MagicMock()
+    processor.execution_stats_lock = threading.Lock()
+    processor.charge_node_usage = AsyncMock(side_effect=charge)
+    processor.on_node_execution = AsyncMock(side_effect=run_node)
+
+    tool_info = ToolInfo(
+        tool_call=MagicMock(id="call_1"),
+        tool_name="write_text",
+        tool_def={"function": {"name": "write_text", "_sink_node_id": "sink"}},
+        input_data={"prompt": "x"},
+        field_mapping={},
+    )
+    params = ExecutionParams(
+        user_id="u",
+        graph_id="g",
+        node_id="n",
+        graph_version=1,
+        graph_exec_id="ge",
+        node_exec_id="ne",
+        execution_context=ExecutionContext(),
+    )
+    with patch(
+        "backend.blocks.orchestrator.get_database_manager_async_client",
+        return_value=mock_db_client,
+    ):
+        await block._execute_single_tool_with_manager(tool_info, params, processor)
+
+    assert order == ["charge", "run"]
+    assert seen_baseline == [60]
