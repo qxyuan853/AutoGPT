@@ -1,4 +1,5 @@
 import json
+import logging
 import shlex
 import uuid
 from typing import TYPE_CHECKING, Literal, Optional
@@ -20,13 +21,28 @@ from backend.data.model import (
     NodeExecutionStats,
     SchemaField,
 )
+from backend.integrations.credentials_store import is_system_credential
 from backend.integrations.providers import ProviderName
 from backend.util.e2b_network import (
     EgressOwner,
     connect_sandbox,
     create_sandbox,
     kill_sandbox,
+    proxy_address,
 )
+
+# ZD-2026-AUTOGPT-CLAUDECODE fix constants.
+# A platform (system) Anthropic key must never be handed raw into a user-controlled sandbox:
+# the box runs user setup_commands and an agent with --dangerously-skip-permissions, and the
+# user may own the E2B account the box runs on. The raw key is replaced with a placeholder here;
+# real egress is expected to go through the credential-swap proxy (backend.util.e2b_network /
+# E2B_EGRESS_PROXY_ADDRESS), which substitutes a scoped per-tenant credential the box never sees.
+_SWAP_PLACEHOLDER = "__anthropic_key_swapped_by_egress_proxy__"
+# A run that reached the sandbox but settled no cost (timeout, kill, non-zero exit, or a
+# total_cost_usd stripped by the user's own `claude` wrapper) still consumed real provider spend.
+# Bill at least this many USD so such a run is never free. Reconciliation may add the CLI's
+# self-reported cost on top when it is present and larger.
+_MIN_RUN_COST_USD = 0.02
 from backend.util.sandbox_files import (
     SandboxFileOutput,
     extract_and_store_sandbox_files,
@@ -35,6 +51,9 @@ from backend.util.sandbox_metadata import SandboxMetadata, owned_by_user
 
 if TYPE_CHECKING:
     from backend.executor.utils import ExecutionContext
+
+
+logger = logging.getLogger(__name__)
 
 
 class ClaudeCodeExecutionError(Exception):
@@ -308,6 +327,7 @@ class ClaudeCodeBlock(Block):
         conversation_history: str,
         dispose_sandbox: bool,
         execution_context: "ExecutionContext",
+        anthropic_is_system: bool = False,
     ) -> tuple[str, list[SandboxFileOutput], str, str, str]:
         """
         Execute Claude Code in an E2B sandbox.
@@ -315,6 +335,23 @@ class ClaudeCodeBlock(Block):
         Returns:
             Tuple of (response, files, conversation_history, session_id, sandbox_id)
         """
+        sandbox = None
+        sandbox_id = ""
+        cost_recorded = False
+
+        # A platform-funded (system) Anthropic key is never placed raw in a user-controlled box:
+        # the box runs the user's setup_commands and an agent with --dangerously-skip-permissions,
+        # and the user may own the E2B account the box runs on, so the raw key would be readable and
+        # returnable in the block's output. Inject a placeholder; the box's egress is routed through
+        # the credential-swap proxy (backend.util.e2b_network / E2B_EGRESS_PROXY_ADDRESS), which
+        # substitutes a scoped per-tenant credential so the operator's key never enters the sandbox.
+        if anthropic_is_system:
+            if proxy_address() is None:
+                logger.warning(
+                    "ClaudeCodeBlock: platform Anthropic key not exposed to the sandbox; "
+                    "configure E2B_EGRESS_PROXY_ADDRESS to route scoped credentials for real runs."
+                )
+            anthropic_api_key = _SWAP_PLACEHOLDER
 
         # Validate that sandbox_id is provided when resuming a session
         if session_id and not existing_sandbox_id:
@@ -325,8 +362,6 @@ class ClaudeCodeBlock(Block):
                 "to restore context on a fresh sandbox."
             )
 
-        sandbox = None
-        sandbox_id = ""
         egress_owner = EgressOwner(
             kind="block",
             id=execution_context.user_id or "anonymous",
@@ -466,7 +501,7 @@ class ClaudeCodeBlock(Block):
                 # The JSON output contains the result
                 output_data = json.loads(raw_output)
                 response = output_data.get("result", raw_output)
-                self._record_cli_cost(output_data)
+                cost_recorded = self._record_cli_cost(output_data)
 
                 # Build conversation history entry
                 turn_entry = f"User: {prompt}\nClaude: {response}"
@@ -513,6 +548,16 @@ class ClaudeCodeBlock(Block):
             raise ClaudeCodeExecutionError(str(e), sandbox_id) from e
 
         finally:
+            # A run that opened a box but recorded no CLI cost (timeout, kill, non-zero exit,
+            # or a user-stripped total_cost_usd) still consumed provider spend: bill a floor so
+            # it is never free. Reconciliation keeps the larger of this and any recorded cost.
+            if sandbox is not None and not cost_recorded:
+                self.merge_stats(
+                    NodeExecutionStats(
+                        provider_cost=_MIN_RUN_COST_USD,
+                        provider_cost_type="cost_usd",
+                    )
+                )
             if dispose_sandbox and sandbox:
                 await kill_sandbox(sandbox)
 
@@ -522,7 +567,7 @@ class ClaudeCodeBlock(Block):
         escaped = prompt.replace("'", "'\"'\"'")
         return f"'{escaped}'"
 
-    def _record_cli_cost(self, output_data: dict) -> None:
+    def _record_cli_cost(self, output_data: dict) -> bool:
         """Feed Claude Code CLI's `total_cost_usd` to the COST_USD resolver.
 
         The CLI rolls up Anthropic LLM + internal tool-call spend into
@@ -531,13 +576,14 @@ class ClaudeCodeBlock(Block):
         """
         total_cost_usd = output_data.get("total_cost_usd")
         if total_cost_usd is None:
-            return
+            return False
         self.merge_stats(
             NodeExecutionStats(
                 provider_cost=float(total_cost_usd),
                 provider_cost_type="cost_usd",
             )
         )
+        return True
 
     async def run(
         self,
@@ -567,6 +613,7 @@ class ClaudeCodeBlock(Block):
                 conversation_history=input_data.conversation_history,
                 dispose_sandbox=input_data.dispose_sandbox,
                 execution_context=execution_context,
+                anthropic_is_system=is_system_credential(anthropic_credentials.id),
             )
 
             yield "response", response
