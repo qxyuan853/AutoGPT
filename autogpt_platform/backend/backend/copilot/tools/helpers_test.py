@@ -203,6 +203,55 @@ class TestExecuteBlockCreditCharging:
         assert call_kwargs["cost"] == 10
         assert call_kwargs["metadata"].reason == "copilot_block_execution"
 
+    async def test_prices_with_resolved_credentials_not_model_supplied(self):
+        """A credentials value the model wrote into input_data must not change
+        the price: the block runs with the resolved credential, so it is priced
+        (and charged) with that one."""
+        block = _make_block()
+        credit_patch, mock_credit = _patch_credit_db(get_credits_return=100)
+        resolved = CredentialsMetaInput(
+            id=exa_credentials.id,
+            provider=exa_credentials.provider,
+            type=exa_credentials.type,
+        )
+        creds_manager_cls = MagicMock()
+        creds_manager_cls.return_value.get = AsyncMock(return_value=exa_credentials)
+        priced: list[dict] = []
+
+        def _price(_block, input_data, **_kwargs):
+            priced.append(dict(input_data))
+            creds = input_data.get("credentials") or {}
+            return (10, {}) if creds.get("id") == exa_credentials.id else (0, {})
+
+        with (
+            _patch_workspace(),
+            _patch_user_db(),
+            patch("backend.copilot.tools.helpers.block_usage_cost", side_effect=_price),
+            patch(
+                "backend.copilot.tools.helpers.IntegrationCredentialsManager",
+                creds_manager_cls,
+            ),
+            credit_patch,
+        ):
+            result = await execute_block(
+                block=block,
+                block_id="block-1",
+                input_data={
+                    "text": "hello",
+                    "credentials": {"id": "stub", "provider": "exa", "type": "api_key"},
+                },
+                user_id=_USER,
+                session_id=_SESSION,
+                node_exec_id="exec-stub",
+                matched_credentials={"credentials": resolved},
+                dry_run=False,
+            )
+
+        assert isinstance(result, BlockOutputResponse)
+        assert priced and priced[0]["credentials"]["id"] == exa_credentials.id
+        mock_credit.spend_credits.assert_awaited_once()
+        assert mock_credit.spend_credits.call_args.kwargs["cost"] == 10
+
     async def test_returns_error_when_insufficient_credits_before_exec(self):
         """Pre-execution check should return ErrorResponse when balance < cost."""
         block = _make_block()
