@@ -1096,15 +1096,20 @@ BLOCK_COSTS: dict[Type[Block], list[BlockCost]] = {
     # matches the 1.5× margin already baked into TOKEN_COST for every
     # direct LLM block. E2B sandbox infra (~$0.00028/s) is absorbed into
     # the margin.
+    # ZD-2026-AUTOGPT-CLAUDECODE-E2BFILTER fix: the paid resource is the platform ANTHROPIC key
+    # (Claude Code's model spend), not the E2B sandbox. Keying the cost on the E2B credential let
+    # a user supply their OWN E2B key so no entry matched and the run billed 0 while the operator's
+    # Anthropic key paid. Key the cost on the system Anthropic credential instead, so every run that
+    # uses platform Anthropic credits is a paid entry regardless of whose E2B account the box is on.
     ClaudeCodeBlock: [
         BlockCost(
             cost_amount=150,
             cost_type=BlockCostType.COST_USD,
             cost_filter={
-                "e2b_credentials": {
-                    "id": e2b_credentials.id,
-                    "provider": e2b_credentials.provider,
-                    "type": e2b_credentials.type,
+                "anthropic_credentials": {
+                    "id": anthropic_credentials.id,
+                    "provider": anthropic_credentials.provider,
+                    "type": anthropic_credentials.type,
                 }
             },
         )
